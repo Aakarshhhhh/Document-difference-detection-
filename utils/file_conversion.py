@@ -7,15 +7,25 @@ import streamlit as st
 import os
 import tempfile
 
-def convert_pdf_to_images(file_stream):
-    """Converts a PDF file stream into a list of PIL Image objects."""
-    doc = fitz.open(stream=file_stream.read(), filetype="pdf")
+def convert_pdf_to_images(file_stream, dpi: int = 220):
+    """Converts a PDF file stream into a list of PIL Image objects.
+    Uses higher DPI for sharper rendering to improve visual diff sensitivity.
+    """
+    # Compute zoom factor from DPI (PDF default is 72 DPI)
+    zoom = max(1.0, dpi / 72.0)
+    mat = fitz.Matrix(zoom, zoom)
+
+    # Ensure we have a fresh readable buffer for PyMuPDF
+    pdf_bytes = file_stream.read() if hasattr(file_stream, "read") else file_stream
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     images = []
     for page_num in range(doc.page_count):
         page = doc.load_page(page_num)
-        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2)) # Render at 2x resolution
+        pix = page.get_pixmap(matrix=mat, alpha=False)  # No alpha; consistent RGB
         img_bytes = pix.tobytes("png")
-        images.append(Image.open(io.BytesIO(img_bytes)))
+        # Ensure PIL opens from its own buffer to avoid lazy file handle issues
+        pil_img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+        images.append(pil_img)
     doc.close()
     return images
 
@@ -163,9 +173,11 @@ def convert_to_comparable_format(uploaded_file):
 
     try:
         if file_type == 'pdf':
-            page_images = convert_pdf_to_images(uploaded_file)
-            # Extract text from PDF
-            doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
+            # Read once, reuse for images and text extraction
+            pdf_bytes = uploaded_file.read()
+            page_images = convert_pdf_to_images(io.BytesIO(pdf_bytes), dpi=240)
+            # Extract text from PDF (reuse same bytes)
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
             for page_num in range(doc.page_count):
                 page = doc.load_page(page_num)
                 extracted_text += page.get_text() + "\n"

@@ -11,6 +11,73 @@ import json
 import datetime
 
 
+def calibrate_visual_params(img_original, img_updated, gt_mask_file=None):
+    """Sweep detection params to find a setting that captures clear changes with low noise."""
+    candidate_thresholds = [0.5, 0.6, 0.7, 0.8, 0.9]
+    candidate_min_sizes = [5, 10, 15]
+    candidate_min_areas = [100, 200, 400, 800]
+
+    best = None
+    best_score = float('-inf')
+
+    gt_mask_arr = None
+    if gt_mask_file is not None:
+        try:
+            gt = Image.open(gt_mask_file).convert('RGB')
+            import numpy as np
+            gta = np.array(gt)
+            # Consider red-ish pixels as positives
+            gt_mask_arr = ((gta[:,:,0] > 180) & (gta[:,:,1] < 100) & (gta[:,:,2] < 100)).astype(np.uint8)
+        except Exception:
+            gt_mask_arr = None
+
+    for thr in candidate_thresholds:
+        for msz in candidate_min_sizes:
+            for mar in candidate_min_areas:
+                try:
+                    _, changes, ssim_score, diff_mask = find_image_differences(
+                        img_original, img_updated,
+                        threshold=thr,
+                        min_change_size=msz,
+                        min_change_area=mar,
+                        enable_edge_detection=True,
+                        enable_color_detection=True,
+                        return_mask=True
+                    )
+                except Exception:
+                    continue
+
+                num_changes = len(changes)
+                if gt_mask_arr is not None and diff_mask is not None and gt_mask_arr.shape == diff_mask.shape:
+                    import numpy as np
+                    pred = diff_mask.astype(bool)
+                    gt = gt_mask_arr.astype(bool)
+                    inter = np.logical_and(pred, gt).sum()
+                    union = np.logical_or(pred, gt).sum()
+                    iou = (inter / union) if union > 0 else 0.0
+                    score = iou * 100.0
+                else:
+                    # Heuristic scoring when no ground truth
+                    if num_changes == 0:
+                        score = -5
+                    else:
+                        target = 6
+                        score = 10 - abs(num_changes - target)
+                    score -= thr * 1.0
+                    score += (msz / 10.0) + (mar / 400.0)
+
+                if score > best_score:
+                    best_score = score
+                    best = {
+                        'threshold': thr,
+                        'min_change_size': msz,
+                        'min_change_area': mar,
+                        'num_changes': num_changes,
+                        'ssim': ssim_score
+                    }
+
+    return best
+
 def main():
     st.set_page_config(layout="wide", page_title="Review Document Changes")
     st.title("Review Document Changes")
@@ -38,6 +105,7 @@ def main():
             # Analysis options
             st.header("Analysis Options")
             show_pixel_comparison = st.checkbox("Enable Pixel-wise Comparison", value=False)
+            pixel_threshold = st.slider("Pixel Threshold (RGB delta)", 5, 100, 30)
             
             # Enhanced threshold options
             st.subheader("Detection Sensitivity")
@@ -71,9 +139,22 @@ def main():
             
             # Additional options
             st.header("Display Options")
+            gt_mask = st.file_uploader("Ground-truth mask (optional, PNG with red marks)", type=["png"])
             show_text_comparison = st.checkbox("Show Text Comparison", value=True)
             show_visual_annotations = st.checkbox("Show Visual Annotations", value=True)
             show_debug_info = st.checkbox("Show Debug Information", value=False)
+            apply_calibrated = st.checkbox("Apply Calibrated Settings (if available)", value=False)
+
+            # ROI controls
+            with st.expander("Region of Interest (focus detection)"):
+                roi_enable = st.checkbox("Enable ROI", value=False)
+                col_roi1, col_roi2 = st.columns(2)
+                with col_roi1:
+                    roi_x = st.number_input("ROI X", min_value=0, value=0)
+                    roi_w = st.number_input("ROI Width", min_value=0, value=0)
+                with col_roi2:
+                    roi_y = st.number_input("ROI Y", min_value=0, value=0)
+                    roi_h = st.number_input("ROI Height", min_value=0, value=0)
 
     if uploaded_file1 and uploaded_file2:
         # Convert files to comparable formats
@@ -140,7 +221,7 @@ def main():
         with col1:
             st.subheader("Original Version")
             if current_page_num < num_pages1:
-                st.image(images1[current_page_num], use_column_width=True, caption=f"Original - Page {current_page_num + 1}")
+                st.image(images1[current_page_num], width='stretch', caption=f"Original - Page {current_page_num + 1}")
             else:
                 st.info("Page not present in Original Document.")
             
@@ -162,10 +243,37 @@ def main():
                 if current_page_num < num_pages1 and current_page_num < num_pages2:
                     with st.spinner("Analyzing visual differences..."):
                         img_original = images1[current_page_num]
+
+                        # Calibration controls
+                        with st.expander("Calibration (optimize detection on this page)"):
+                            if st.button("Calibrate on this page"):
+                                with st.spinner("Calibrating parameters..."):
+                                    rec = calibrate_visual_params(img_original, img_updated, gt_mask_file=gt_mask)
+                                    st.session_state['calibrated_params'] = rec
+                            rec = st.session_state.get('calibrated_params')
+                            if rec:
+                                st.success(f"Recommended: threshold={rec['threshold']}, min_size={rec['min_change_size']}, min_area={rec['min_change_area']} (changes={rec['num_changes']}, SSIM={rec['ssim']:.2f})")
                         
                         if show_visual_annotations:
-                            diff_img, changes, ssim_score = find_image_differences(img_original, img_updated, threshold)
-                            st.image(diff_img, use_column_width=True, caption=f"Updated - Page {current_page_num + 1} (SSIM: {ssim_score:.2f})")
+                            # Use calibrated parameters if requested and available
+                            rec = st.session_state.get('calibrated_params') if apply_calibrated else None
+                            use_thr = rec['threshold'] if rec else threshold
+                            use_msz = rec['min_change_size'] if rec else min_change_size
+                            use_mar = rec['min_change_area'] if rec else min_change_area
+                            diff_img, changes, ssim_score = find_image_differences(
+                                img_original,
+                                img_updated,
+                                threshold=use_thr,
+                                min_change_size=use_msz,
+                                min_change_area=use_mar,
+                                enable_edge_detection=enable_edge_detection,
+                                enable_color_detection=enable_color_detection,
+                                roi=(roi_x, roi_y, roi_w, roi_h) if roi_enable and roi_w > 0 and roi_h > 0 else None
+                            )
+                            # If ROI is enabled, crop preview to emphasize region
+                            if roi_enable and roi_w > 0 and roi_h > 0:
+                                diff_img = diff_img.crop((roi_x, roi_y, roi_x + roi_w, roi_y + roi_h))
+                            st.image(diff_img, width='stretch', caption=f"Updated - Page {current_page_num + 1} (SSIM: {ssim_score:.2f})")
                             
                             # Enhanced debug information
                             if show_debug_info:
@@ -187,14 +295,27 @@ def main():
                                                 bbox = change['bbox']
                                                 st.write(f"  Location: ({bbox[0]}, {bbox[1]}) Size: {bbox[2]}x{bbox[3]}")
                         else:
-                            st.image(img_updated, use_column_width=True, caption=f"Updated - Page {current_page_num + 1}")
+                            st.image(img_updated, width='stretch', caption=f"Updated - Page {current_page_num + 1}")
                             # Still perform analysis for summary
-                            _, changes, ssim_score = find_image_differences(img_original, img_updated, threshold)
+                            rec = st.session_state.get('calibrated_params') if apply_calibrated else None
+                            use_thr = rec['threshold'] if rec else threshold
+                            use_msz = rec['min_change_size'] if rec else min_change_size
+                            use_mar = rec['min_change_area'] if rec else min_change_area
+                            _, changes, ssim_score = find_image_differences(
+                                img_original,
+                                img_updated,
+                                threshold=use_thr,
+                                min_change_size=use_msz,
+                                min_change_area=use_mar,
+                                enable_edge_detection=enable_edge_detection,
+                                enable_color_detection=enable_color_detection,
+                                roi=(roi_x, roi_y, roi_w, roi_h) if roi_enable and roi_w > 0 and roi_h > 0 else None
+                            )
                         
                         # Pixel-wise comparison if enabled
                         if show_pixel_comparison:
                             with st.expander("Pixel-wise Comparison Details"):
-                                pixel_mask = compare_images_pixel_wise(img_original, img_updated)
+                                pixel_mask = compare_images_pixel_wise(img_original, img_updated, threshold=pixel_threshold)
                                 st.write(f"Pixel differences detected: {pixel_mask.sum()} pixels")
                                 
                                 # Create a visualization of pixel differences
@@ -208,12 +329,12 @@ def main():
                                                  np.array([255, 0, 0]), 
                                                  original_array)
                                 overlay_img = Image.fromarray(overlay.astype(np.uint8))
-                                st.image(overlay_img, caption="Pixel-level differences (Red)", use_column_width=True)
+                                st.image(overlay_img, caption="Pixel-level differences (Red)", width='stretch')
                         
                         # Store changes in session state for summary
                         st.session_state[f'page_{current_page_num}_changes'] = changes
                 else:
-                    st.image(img_updated, use_column_width=True, caption=f"Updated - Page {current_page_num + 1}")
+                    st.image(img_updated, width='stretch', caption=f"Updated - Page {current_page_num + 1}")
                     st.session_state[f'page_{current_page_num}_changes'] = []
             else:
                 st.info("Page not present in Updated Document (likely an addition).")
