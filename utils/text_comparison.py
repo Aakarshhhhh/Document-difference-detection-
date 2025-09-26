@@ -1,6 +1,9 @@
 import difflib
 import re
 from typing import List, Dict, Tuple
+import fitz  # PyMuPDF for text positioning
+from PIL import Image, ImageDraw, ImageFont
+import numpy as np
 
 def compare_texts(text1: str, text2: str):
     """
@@ -256,3 +259,402 @@ def find_word_level_changes(text1: str, text2: str):
             change_num += 1
     
     return changes
+
+def extract_text_with_positions(pdf_bytes, page_num=0):
+    """
+    Extract text from PDF with precise positioning information for each word.
+    """
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        if page_num >= doc.page_count:
+            return []
+        
+        page = doc.load_page(page_num)
+        
+        # Get text with detailed positioning
+        text_dict = page.get_text("dict")
+        
+        words_with_positions = []
+        
+        for block in text_dict["blocks"]:
+            if "lines" in block:  # Text block
+                for line in block["lines"]:
+                    for span in line["spans"]:
+                        # Extract individual words from the span
+                        text = span["text"]
+                        bbox = span["bbox"]  # (x0, y0, x1, y1)
+                        font_info = {
+                            "font": span.get("font", ""),
+                            "size": span.get("size", 12),
+                            "flags": span.get("flags", 0)
+                        }
+                        
+                        # Split into words and estimate positions
+                        words = text.split()
+                        if words:
+                            word_width = (bbox[2] - bbox[0]) / len(text) if len(text) > 0 else 0
+                            
+                            char_pos = 0
+                            for word in words:
+                                word_x0 = bbox[0] + char_pos * word_width
+                                word_x1 = word_x0 + len(word) * word_width
+                                word_bbox = (word_x0, bbox[1], word_x1, bbox[3])
+                                
+                                words_with_positions.append({
+                                    'text': word,
+                                    'bbox': word_bbox,
+                                    'font_info': font_info
+                                })
+                                
+                                char_pos += len(word) + 1  # +1 for space
+        
+        doc.close()
+        return words_with_positions
+        
+    except Exception as e:
+        print(f"Error extracting text with positions: {e}")
+        return []
+
+def compare_documents_with_text_overlay(pdf1_bytes, pdf2_bytes, page1_num=0, page2_num=None):
+    """
+    Compare two PDF documents and return separate highlighted images for original (with deletions) 
+    and updated (with additions) documents, just like in the reference image.
+    """
+    try:
+        # Use the same page number for both if only one is provided
+        if page2_num is None:
+            page2_num = page1_num
+        
+        # Extract text with positions from both documents
+        words1 = extract_text_with_positions(pdf1_bytes, page1_num)
+        words2 = extract_text_with_positions(pdf2_bytes, page2_num)
+        
+        # Get word-level differences
+        words1_list = [w['text'] for w in words1]
+        words2_list = [w['text'] for w in words2]
+        
+        # Use SequenceMatcher for word-level comparison
+        matcher = difflib.SequenceMatcher(None, words1_list, words2_list)
+        
+        # Render both document pages at high DPI
+        zoom = 2.0  # 144 DPI
+        mat = fitz.Matrix(zoom, zoom)
+        
+        # Get original document image
+        doc1 = fitz.open(stream=pdf1_bytes, filetype="pdf")
+        page1 = doc1.load_page(page1_num)
+        pix1 = page1.get_pixmap(matrix=mat, alpha=False)
+        img1_bytes = pix1.tobytes("png")
+        from io import BytesIO
+        original_image = Image.open(BytesIO(img1_bytes)).convert('RGB')
+        doc1.close()
+        
+        # Get updated document image
+        doc2 = fitz.open(stream=pdf2_bytes, filetype="pdf")
+        page2 = doc2.load_page(page2_num)
+        pix2 = page2.get_pixmap(matrix=mat, alpha=False)
+        img2_bytes = pix2.tobytes("png")
+        updated_image = Image.open(BytesIO(img2_bytes)).convert('RGB')
+        doc2.close()
+        
+        # Create overlays for both images
+        original_overlay = Image.new('RGBA', original_image.size, (255, 255, 255, 0))
+        updated_overlay = Image.new('RGBA', updated_image.size, (255, 255, 255, 0))
+        
+        draw_original = ImageDraw.Draw(original_overlay)
+        draw_updated = ImageDraw.Draw(updated_overlay)
+        
+        # Colors for highlighting - more visible colors
+        deletion_color = (255, 0, 0, 160)    # Brighter red with more opacity for deletions
+        addition_color = (0, 200, 0, 160)    # Brighter green with more opacity for additions
+        
+        # Process differences
+        changes_detected = []
+        
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag == 'delete':  # Text removed - highlight on original document
+                for idx in range(i1, i2):
+                    if idx < len(words1):
+                        word_info = words1[idx]
+                        bbox = word_info['bbox']
+                        scaled_bbox = (
+                            bbox[0] * zoom, bbox[1] * zoom,
+                            bbox[2] * zoom, bbox[3] * zoom
+                        )
+                        
+                        # Highlight deletion in red on original document
+                        draw_original.rectangle(scaled_bbox, fill=deletion_color)
+                        changes_detected.append({
+                            'type': 'deletion',
+                            'text': word_info['text'],
+                            'bbox': scaled_bbox,
+                            'document': 'original'
+                        })
+            
+            elif tag == 'insert':  # Text added - highlight on updated document
+                for idx in range(j1, j2):
+                    if idx < len(words2):
+                        word_info = words2[idx]
+                        bbox = word_info['bbox']
+                        scaled_bbox = (
+                            bbox[0] * zoom, bbox[1] * zoom,
+                            bbox[2] * zoom, bbox[3] * zoom
+                        )
+                        
+                        # Highlight addition in green on updated document
+                        draw_updated.rectangle(scaled_bbox, fill=addition_color)
+                        changes_detected.append({
+                            'type': 'addition', 
+                            'text': word_info['text'],
+                            'bbox': scaled_bbox,
+                            'document': 'updated'
+                        })
+            
+            elif tag == 'replace':  # Text modified
+                # Highlight old text (deletion) in red on original document
+                for idx in range(i1, i2):
+                    if idx < len(words1):
+                        word_info = words1[idx]
+                        bbox = word_info['bbox']
+                        scaled_bbox = (
+                            bbox[0] * zoom, bbox[1] * zoom,
+                            bbox[2] * zoom, bbox[3] * zoom
+                        )
+                        
+                        draw_original.rectangle(scaled_bbox, fill=deletion_color)
+                        changes_detected.append({
+                            'type': 'deletion',
+                            'text': word_info['text'],
+                            'bbox': scaled_bbox,
+                            'document': 'original'
+                        })
+                
+                # Highlight new text (addition) in green on updated document
+                for idx in range(j1, j2):
+                    if idx < len(words2):
+                        word_info = words2[idx]
+                        bbox = word_info['bbox']
+                        scaled_bbox = (
+                            bbox[0] * zoom, bbox[1] * zoom,
+                            bbox[2] * zoom, bbox[3] * zoom
+                        )
+                        
+                        draw_updated.rectangle(scaled_bbox, fill=addition_color)
+                        changes_detected.append({
+                            'type': 'addition',
+                            'text': word_info['text'], 
+                            'bbox': scaled_bbox,
+                            'document': 'updated'
+                        })
+        
+        # Composite the overlays onto the base images
+        original_result = Image.alpha_composite(original_image.convert('RGBA'), original_overlay)
+        updated_result = Image.alpha_composite(updated_image.convert('RGBA'), updated_overlay)
+        
+        original_result = original_result.convert('RGB')
+        updated_result = updated_result.convert('RGB')
+        
+        return original_result, updated_result, changes_detected
+        
+    except Exception as e:
+        print(f"Error in text overlay comparison: {e}")
+        return None, None, []
+
+def create_text_diff_image(file1_bytes, file2_bytes, page1_num=0, page2_num=None):
+    """
+    Create highlighted images for both original and updated documents showing text-level changes.
+    Returns (original_with_deletions, updated_with_additions, changes_list)
+    """
+    try:
+        # Use the same page number for both if only one is provided
+        if page2_num is None:
+            page2_num = page1_num
+        
+        # First try PDF text extraction with positioning
+        original_img, updated_img, changes = compare_documents_with_text_overlay(
+            file1_bytes, file2_bytes, page1_num, page2_num
+        )
+        
+        if original_img is not None and updated_img is not None:
+            return original_img, updated_img, changes
+        
+        # Fallback to basic rendering if highlighting fails
+        doc1 = fitz.open(stream=file1_bytes, filetype="pdf")
+        doc2 = fitz.open(stream=file2_bytes, filetype="pdf")
+        
+        if page1_num < doc1.page_count and page2_num < doc2.page_count:
+            # Render both pages without highlighting
+            zoom = 2.0
+            mat = fitz.Matrix(zoom, zoom)
+            
+            # Original page
+            page1 = doc1.load_page(page1_num)
+            pix1 = page1.get_pixmap(matrix=mat, alpha=False)
+            img1_bytes = pix1.tobytes("png")
+            from io import BytesIO
+            original_image = Image.open(BytesIO(img1_bytes)).convert('RGB')
+            
+            # Updated page  
+            page2 = doc2.load_page(page2_num)
+            pix2 = page2.get_pixmap(matrix=mat, alpha=False)
+            img2_bytes = pix2.tobytes("png")
+            updated_image = Image.open(BytesIO(img2_bytes)).convert('RGB')
+            
+            doc1.close()
+            doc2.close()
+            
+            return original_image, updated_image, []
+        
+        doc1.close()
+        doc2.close()
+        return None, None, []
+        
+    except Exception as e:
+        print(f"Error creating text diff image: {e}")
+        return None, None, []
+
+def create_page_mapping(text1_list, text2_list, similarity_threshold=0.3):
+    """
+    Create a mapping between pages of two documents based on text similarity.
+    text1_list and text2_list are lists of strings, one per page.
+    Returns a mapping dict and similarity matrix.
+    Optimized for performance with large documents.
+    """
+    try:
+        import numpy as np
+        
+        num_pages1 = len(text1_list)
+        num_pages2 = len(text2_list)
+        
+        if num_pages1 == 0 or num_pages2 == 0:
+            return {}, np.array([])
+            
+        # For very large documents, use simple sequential mapping
+        if num_pages1 > 50 or num_pages2 > 50:
+            simple_mapping = {i: i for i in range(min(num_pages1, num_pages2))}
+            return simple_mapping, None
+        
+        # Calculate similarity matrix with optimization
+        similarity_matrix = np.zeros((num_pages1, num_pages2))
+        
+        for i in range(num_pages1):
+            for j in range(num_pages2):
+                # Calculate text similarity using difflib
+                text1_clean = text1_list[i].strip().lower()[:1000]  # Limit to first 1000 chars for performance
+                text2_clean = text2_list[j].strip().lower()[:1000]  # Limit to first 1000 chars for performance
+                
+                # Skip very short texts
+                if len(text1_clean) < 10 and len(text2_clean) < 10:
+                    similarity_matrix[i, j] = 1.0 if i == j else 0.0
+                    continue
+                
+                # Use SequenceMatcher for similarity with autojunk=False for speed
+                similarity = difflib.SequenceMatcher(None, text1_clean, text2_clean, autojunk=False).ratio()
+                similarity_matrix[i, j] = similarity
+        
+        # Create mapping using greedy approach (highest similarity first)
+        page_mapping = {}
+        used_pages2 = set()
+        
+        # Sort page pairs by similarity (highest first)
+        page_pairs = []
+        for i in range(num_pages1):
+            for j in range(num_pages2):
+                if similarity_matrix[i, j] >= similarity_threshold:
+                    page_pairs.append((i, j, similarity_matrix[i, j]))
+        
+        page_pairs.sort(key=lambda x: x[2], reverse=True)
+        
+        # Assign mappings (greedy: highest similarity first)
+        for page1, page2, similarity in page_pairs:
+            if page1 not in page_mapping and page2 not in used_pages2:
+                page_mapping[page1] = page2
+                used_pages2.add(page2)
+        
+        return page_mapping, similarity_matrix
+    
+    except ImportError:
+        # If numpy is not available, fall back to simple mapping
+        print("NumPy not available, using simple page mapping")
+        simple_mapping = {}
+        for i in range(min(len(text1_list), len(text2_list))):
+            simple_mapping[i] = i
+        return simple_mapping, None
+    except Exception as e:
+        print(f"Error creating page mapping: {e}")
+        return {}, None
+
+def get_page_mapping_info(logical_page, page_mapping, num_pages1, num_pages2):
+    """
+    Get the physical page numbers for a given logical page index.
+    Returns (original_page_num, updated_page_num) or (None, None) if page doesn't exist.
+    """
+    # Try to find the best mapping for this logical page
+    original_page = None
+    updated_page = None
+    
+    # Check if we have a direct mapping
+    if logical_page in page_mapping:
+        original_page = logical_page
+        updated_page = page_mapping[logical_page]
+    elif logical_page < num_pages1 and logical_page < num_pages2:
+        # Both documents have this page number, assume direct mapping
+        original_page = logical_page
+        updated_page = logical_page
+    elif logical_page < num_pages1:
+        # Only original has this page
+        original_page = logical_page
+        updated_page = None
+    elif logical_page < num_pages2:
+        # Only updated has this page (look for reverse mapping)
+        # Find if any original page maps to this logical page
+        for orig_page, upd_page in page_mapping.items():
+            if upd_page == logical_page:
+                original_page = orig_page
+                updated_page = logical_page
+                break
+        if original_page is None:
+            # No reverse mapping found, treat as new page
+            original_page = None
+            updated_page = logical_page
+    
+    return original_page, updated_page
+
+def get_page_mapping_summary(page_mapping, num_pages1, num_pages2):
+    """
+    Generate a human-readable summary of page mappings.
+    """
+    total_logical_pages = max(num_pages1, num_pages2)
+    mapped_pages = len(page_mapping)
+    unmapped_original = num_pages1 - mapped_pages
+    unmapped_updated = num_pages2 - mapped_pages
+    
+    summary = {
+        'total_logical_pages': total_logical_pages,
+        'mapped_pages': mapped_pages,
+        'unmapped_original': max(0, unmapped_original),
+        'unmapped_updated': max(0, unmapped_updated),
+        'mapping_details': []
+    }
+    
+    # Add details for each logical page
+    for logical_page in range(total_logical_pages):
+        orig_page, upd_page = get_page_mapping_info(logical_page, page_mapping, num_pages1, num_pages2)
+        
+        if orig_page is not None and upd_page is not None:
+            status = "Mapped"
+        elif orig_page is not None:
+            status = "Only in original"
+        elif upd_page is not None:
+            status = "Only in updated"
+        else:
+            status = "Missing"
+        
+        summary['mapping_details'].append({
+            'logical_page': logical_page + 1,  # 1-based for display
+            'original_page': (orig_page + 1) if orig_page is not None else None,
+            'updated_page': (upd_page + 1) if upd_page is not None else None,
+            'status': status
+        })
+    
+    return summary

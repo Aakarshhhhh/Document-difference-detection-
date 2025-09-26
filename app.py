@@ -5,8 +5,8 @@ import fitz
 import streamlit.components.v1 as components
 
 from utils.file_conversion import convert_to_comparable_format, get_file_type
-from utils.image_comparison import find_image_differences, compare_images_pixel_wise
-from utils.text_comparison import compare_texts, highlight_text_differences_html, get_text_diff_summary, find_word_level_changes
+from utils.image_comparison import find_image_differences, compare_images_pixel_wise, find_ultra_subtle_differences
+from utils.text_comparison import compare_texts, highlight_text_differences_html, get_text_diff_summary, find_word_level_changes, create_text_diff_image
 import json
 import datetime
 
@@ -135,6 +135,7 @@ def main():
                 enable_edge_detection = st.checkbox("Enable Edge-based Detection", value=True)
                 enable_color_detection = st.checkbox("Enable Color Change Detection", value=True)
                 enable_template_matching = st.checkbox("Enable Template Matching", value=False)
+                enable_text_highlighting = st.checkbox("Enable Word-Level Text Highlighting", value=True, help="Highlight specific text changes like additions, deletions, and modifications directly on the document")
                 min_change_size = st.slider("Minimum Change Size (pixels)", 5, 50, 10)
             
             # Additional options
@@ -157,11 +158,26 @@ def main():
                     roi_h = st.number_input("ROI Height", min_value=0, value=0)
 
     if uploaded_file1 and uploaded_file2:
-        # Convert files to comparable formats
-        with st.spinner("Converting original document..."):
-            images1, text1 = convert_to_comparable_format(uploaded_file1)
-        with st.spinner("Converting updated document..."):
-            images2, text2 = convert_to_comparable_format(uploaded_file2)
+        # Convert files to comparable formats with error handling
+        try:
+            with st.spinner("Converting original document..."):
+                images1, text1 = convert_to_comparable_format(uploaded_file1)
+                if not images1:
+                    st.error("Failed to process original document. Please check the file format.")
+                    return
+        except Exception as e:
+            st.error(f"Error processing original document: {str(e)}")
+            return
+            
+        try:
+            with st.spinner("Converting updated document..."):
+                images2, text2 = convert_to_comparable_format(uploaded_file2)
+                if not images2:
+                    st.error("Failed to process updated document. Please check the file format.")
+                    return
+        except Exception as e:
+            st.error(f"Error processing updated document: {str(e)}")
+            return
         
         # Calculate overall statistics
         num_pages1 = len(images1)
@@ -169,9 +185,47 @@ def main():
         page_additions = max(0, num_pages2 - num_pages1)
         page_removals = max(0, num_pages1 - num_pages2)
         
-        # Analyze text changes
-        text_differences = compare_texts(text1, text2)
-        text_summary = get_text_diff_summary(text_differences)
+        # Analyze text changes with progress indication
+        with st.spinner("Analyzing text differences..."):
+            text_differences = compare_texts(text1, text2)
+            text_summary = get_text_diff_summary(text_differences)
+        
+        # Create intelligent page mapping with optimization for large documents
+        with st.spinner("Creating page mappings (this may take a moment for large documents)..."):
+            from utils.text_comparison import create_page_mapping, get_page_mapping_info, get_page_mapping_summary
+            
+            # Split text into pages for mapping
+            try:
+                # Split text1 and text2 into page-wise lists
+                text1_pages = text1.split('\n\n') if len(text1.split('\n\n')) == num_pages1 else [text1[i:i+1000] for i in range(0, len(text1), 1000)][:num_pages1]
+                text2_pages = text2.split('\n\n') if len(text2.split('\n\n')) == num_pages2 else [text2[i:i+1000] for i in range(0, len(text2), 1000)][:num_pages2]
+                
+                # Ensure we have the right number of pages
+                if len(text1_pages) != num_pages1:
+                    text1_pages = [text1] * num_pages1  # Fallback
+                if len(text2_pages) != num_pages2:
+                    text2_pages = [text2] * num_pages2  # Fallback
+                
+                # For large documents (>20 pages), use simplified mapping
+                if num_pages1 > 20 or num_pages2 > 20:
+                    st.info(f"Large document detected ({max(num_pages1, num_pages2)} pages). Using simplified page mapping for better performance.")
+                    page_mapping = {i: i for i in range(min(num_pages1, num_pages2))}
+                    similarity_matrix = None
+                else:
+                    page_mapping, similarity_matrix = create_page_mapping(text1_pages, text2_pages, similarity_threshold=0.2)
+                
+                mapping_summary = get_page_mapping_summary(page_mapping, num_pages1, num_pages2)
+                
+            except Exception as e:
+                st.warning(f"Page mapping failed: {e}. Using simple sequential mapping.")
+                page_mapping = {i: i for i in range(min(num_pages1, num_pages2))}
+                similarity_matrix = None
+                mapping_summary = {'total_logical_pages': max(num_pages1, num_pages2), 'mapped_pages': min(num_pages1, num_pages2)}
+        
+        # Store page mapping in session state
+        if 'page_mapping' not in st.session_state:
+            st.session_state['page_mapping'] = page_mapping
+            st.session_state['mapping_summary'] = mapping_summary
         
         # Overall summary metrics
         st.subheader("Document Comparison Summary")
@@ -198,51 +252,175 @@ def main():
 
         max_pages = max(num_pages1, num_pages2)
         
-        # Page navigation
+        # Page navigation with mapping info
         col_nav1, col_nav2, col_nav3 = st.columns([1, 2, 1])
+        
+        # Get the current page mapping for display
+        current_logical_page = st.session_state.page_num
+        
+        # Ensure current_logical_page is within bounds
+        if current_logical_page >= max_pages:
+            st.session_state.page_num = max_pages - 1
+            current_logical_page = st.session_state.page_num
+        elif current_logical_page < 0:
+            st.session_state.page_num = 0
+            current_logical_page = st.session_state.page_num
+        
+        original_page_num, updated_page_num = get_page_mapping_info(
+            current_logical_page, 
+            st.session_state['page_mapping'], 
+            num_pages1, 
+            num_pages2
+        )
+        
         with col_nav1:
-            if st.button("⬅ Previous Page", disabled=st.session_state.page_num == 0):
-                if st.session_state.page_num > 0:
-                    st.session_state.page_num -= 1
+            # Use unique keys to prevent conflicts
+            prev_key = f"prev_page_{current_logical_page}"
+            if st.button("⬅ Previous Page", disabled=st.session_state.page_num == 0, key=prev_key):
+                st.session_state.page_num = max(0, st.session_state.page_num - 1)
+                # Clear page-specific cached data
+                st.session_state.pop(f'original_highlighted_{current_logical_page}', None)
+                st.session_state.pop(f'updated_highlighted_{current_logical_page}', None)
+                st.rerun()
+        
         with col_nav2:
-            st.markdown(f"<h3 style='text-align: center;'>Page {st.session_state.page_num + 1} of {max_pages}</h3>", unsafe_allow_html=True)
+            # Show logical page number and physical page mapping
+            logical_page_display = st.session_state.page_num + 1
+            original_display = f"Orig: {original_page_num + 1}" if original_page_num is not None else "Orig: N/A"
+            updated_display = f"Upd: {updated_page_num + 1}" if updated_page_num is not None else "Upd: N/A"
+            st.markdown(f"<h3 style='text-align: center;'>Logical Page {logical_page_display} of {max_pages}</h3>", unsafe_allow_html=True)
+            st.markdown(f"<p style='text-align: center; color: #666; font-size: 0.9em;'>({original_display}, {updated_display})</p>", unsafe_allow_html=True)
+        
         with col_nav3:
-            if st.button("Next Page ➡", disabled=st.session_state.page_num >= max_pages - 1):
-                if st.session_state.page_num < max_pages - 1:
-                    st.session_state.page_num += 1
+            # Use unique keys to prevent conflicts
+            next_key = f"next_page_{current_logical_page}"
+            if st.button("Next Page ➡", disabled=st.session_state.page_num >= max_pages - 1, key=next_key):
+                st.session_state.page_num = min(max_pages - 1, st.session_state.page_num + 1)
+                # Clear page-specific cached data
+                st.session_state.pop(f'original_highlighted_{current_logical_page}', None)
+                st.session_state.pop(f'updated_highlighted_{current_logical_page}', None)
+                st.rerun()
         
         st.markdown("---")
 
+        # Pre-process highlighting if needed (before displaying images)
+        original_highlighted_img = None
+        updated_highlighted_img = None
+        text_changes = []
+        
+        if (original_page_num is not None and updated_page_num is not None and
+            enable_text_highlighting and 
+            get_file_type(uploaded_file1.name) == 'pdf' and 
+            get_file_type(uploaded_file2.name) == 'pdf'):
+            
+            # Check if we already have highlighted images for this page
+            original_key = f'original_highlighted_{current_logical_page}'
+            updated_key = f'updated_highlighted_{current_logical_page}'
+            
+            if original_key in st.session_state and updated_key in st.session_state:
+                # Use cached highlighted images
+                original_highlighted_img = st.session_state[original_key]
+                updated_highlighted_img = st.session_state[updated_key]
+                text_changes = st.session_state.get(f'text_changes_{current_logical_page}', [])
+            else:
+                # Generate new highlighted images
+                with st.spinner("Analyzing text-level changes..."):
+                    # Get PDF bytes for both documents
+                    uploaded_file1.seek(0)
+                    uploaded_file2.seek(0)
+                    pdf1_bytes = uploaded_file1.read()
+                    pdf2_bytes = uploaded_file2.read()
+                    
+                    # Create text-highlighted images for both documents
+                    original_highlighted_img, updated_highlighted_img, text_changes = create_text_diff_image(
+                        pdf1_bytes, pdf2_bytes, original_page_num, updated_page_num
+                    )
+                    
+                    if original_highlighted_img is not None and updated_highlighted_img is not None:
+                        # Store the highlighted images for display (page-specific)
+                        st.session_state[original_key] = original_highlighted_img
+                        st.session_state[updated_key] = updated_highlighted_img
+                        st.session_state[f'text_changes_{current_logical_page}'] = text_changes
+        
         # Main comparison view
         col1, col2, col3 = st.columns([4, 4, 2])
-        
-        current_page_num = st.session_state.page_num
 
         with col1:
             st.subheader("Original Version")
-            if current_page_num < num_pages1:
-                st.image(images1[current_page_num], width='stretch', caption=f"Original - Page {current_page_num + 1}")
+            if original_page_num is not None:
+                try:
+                    # Display highlighted version if available, otherwise original
+                    if original_highlighted_img is not None:
+                        st.image(original_highlighted_img, use_column_width=True, 
+                               caption=f"🔴 Original with Deletions - Page {original_page_num + 1}")
+                        # Add status indicator
+                        deletions = sum(1 for c in text_changes if c['type'] == 'deletion')
+                        st.success(f"✨ Showing {deletions} red deletion highlights")
+                    elif 0 <= original_page_num < len(images1):
+                        st.image(images1[original_page_num], use_column_width=True, caption=f"Original - Page {original_page_num + 1}")
+                    else:
+                        st.error(f"Original page {original_page_num + 1} is out of bounds (max: {len(images1)})")
+                except Exception as e:
+                    st.error(f"Error displaying original page: {e}")
             else:
                 st.info("Page not present in Original Document.")
             
             # Display original text for the page
             original_page_text = ""
-            if get_file_type(uploaded_file1.name) == 'pdf':
+            if get_file_type(uploaded_file1.name) == 'pdf' and original_page_num is not None:
                 uploaded_file1.seek(0)
                 doc = fitz.open(stream=uploaded_file1.read(), filetype="pdf")
-                if current_page_num < doc.page_count:
-                    original_page_text = doc.load_page(current_page_num).get_text()
+                if original_page_num < doc.page_count:
+                    original_page_text = doc.load_page(original_page_num).get_text()
                 doc.close()
 
         with col2:
             st.subheader("Updated Version")
-            if current_page_num < num_pages2:
-                img_updated = images2[current_page_num]
+            if updated_page_num is not None:
+                try:
+                    if 0 <= updated_page_num < len(images2):
+                        img_updated = images2[updated_page_num]
+                    else:
+                        st.error(f"Updated page {updated_page_num + 1} is out of bounds (max: {len(images2)})")
+                        st.session_state[f'page_{current_logical_page}_changes'] = []
+                        return
+                except Exception as e:
+                    st.error(f"Error accessing updated page: {e}")
+                    st.session_state[f'page_{current_logical_page}_changes'] = []
+                    return
                 
-                # Perform image comparison if both pages exist
-                if current_page_num < num_pages1 and current_page_num < num_pages2:
+                # Display highlighted version if available, otherwise original
+                if updated_highlighted_img is not None:
+                    st.image(updated_highlighted_img, use_column_width=True, 
+                            caption=f"🟢 Updated with Additions - Page {updated_page_num + 1}")
+                    
+                    # Count and display change information
+                    deletions = sum(1 for c in text_changes if c['type'] == 'deletion')
+                    additions = sum(1 for c in text_changes if c['type'] == 'addition')
+                    st.info(f"📚 Found {len(text_changes)} word-level changes ({deletions} deletions, {additions} additions)")
+                    
+                    if show_debug_info:
+                        st.success(f"✨ Text highlighting active: Original page has {deletions} red highlights, Updated page has {additions} green highlights")
+                    
+                    # Show text change details
+                    if text_changes and show_debug_info:
+                        with st.expander("Text Changes Details", expanded=False):
+                            for i, change in enumerate(text_changes):
+                                color = "🟢" if change['type'] == 'addition' else "🔴"
+                                doc_indicator = f"({change.get('document', 'unknown')})"
+                                st.write(f"{color} **{change['type'].title()}** {doc_indicator}: '{change['text']}'")
+                    
+                    # Store text changes for summary
+                    changes = text_changes
+                    ssim_score = 1.0 - (len(text_changes) * 0.1)  # Rough estimate
+                    
+                    # Store changes in session state for summary
+                    st.session_state[f'page_{current_logical_page}_changes'] = changes
+                    
+                elif original_page_num is not None:
+                    # Perform image comparison if both pages exist but no text highlighting
                     with st.spinner("Analyzing visual differences..."):
-                        img_original = images1[current_page_num]
+                        img_original = images1[original_page_num]
 
                         # Calibration controls
                         with st.expander("Calibration (optimize detection on this page)"):
@@ -255,25 +433,40 @@ def main():
                                 st.success(f"Recommended: threshold={rec['threshold']}, min_size={rec['min_change_size']}, min_area={rec['min_change_area']} (changes={rec['num_changes']}, SSIM={rec['ssim']:.2f})")
                         
                         if show_visual_annotations:
-                            # Use calibrated parameters if requested and available
-                            rec = st.session_state.get('calibrated_params') if apply_calibrated else None
-                            use_thr = rec['threshold'] if rec else threshold
-                            use_msz = rec['min_change_size'] if rec else min_change_size
-                            use_mar = rec['min_change_area'] if rec else min_change_area
-                            diff_img, changes, ssim_score = find_image_differences(
-                                img_original,
-                                img_updated,
-                                threshold=use_thr,
-                                min_change_size=use_msz,
-                                min_change_area=use_mar,
-                                enable_edge_detection=enable_edge_detection,
-                                enable_color_detection=enable_color_detection,
-                                roi=(roi_x, roi_y, roi_w, roi_h) if roi_enable and roi_w > 0 and roi_h > 0 else None
-                            )
-                            # If ROI is enabled, crop preview to emphasize region
-                            if roi_enable and roi_w > 0 and roi_h > 0:
-                                diff_img = diff_img.crop((roi_x, roi_y, roi_x + roi_w, roi_y + roi_h))
-                            st.image(diff_img, width='stretch', caption=f"Updated - Page {current_page_num + 1} (SSIM: {ssim_score:.2f})")
+                            # Initialize variables to avoid scope issues
+                            diff_img = None
+                            changes = []
+                            ssim_score = 1.0
+                            
+                            if not enable_text_highlighting:
+                                # Use calibrated parameters if requested and available
+                                rec = st.session_state.get('calibrated_params') if apply_calibrated else None
+                                use_thr = rec['threshold'] if rec else threshold
+                                use_msz = rec['min_change_size'] if rec else min_change_size
+                                use_mar = rec['min_change_area'] if rec else min_change_area
+                                
+                                # Use ultra-sensitive detection for "Ultra Sensitive" mode
+                                if detection_mode == "Ultra Sensitive":
+                                    with st.spinner("Running ultra-sensitive analysis..."):
+                                        diff_img, changes, ssim_score = find_ultra_subtle_differences(
+                                            img_original, img_updated
+                                        )
+                                        st.info(f"🔍 Ultra-sensitive mode detected {len(changes)} micro-changes")
+                                else:
+                                    diff_img, changes, ssim_score = find_image_differences(
+                                        img_original,
+                                        img_updated,
+                                        threshold=use_thr,
+                                        min_change_size=use_msz,
+                                        min_change_area=use_mar,
+                                        enable_edge_detection=enable_edge_detection,
+                                        enable_color_detection=enable_color_detection,
+                                        roi=(roi_x, roi_y, roi_w, roi_h) if roi_enable and roi_w > 0 and roi_h > 0 else None
+                                    )
+                                
+                                if diff_img is not None:
+                                    st.image(diff_img, use_column_width=True, caption=f"Updated - Page {updated_page_num + 1} (SSIM: {ssim_score:.2f})")
+                            
                             
                             # Enhanced debug information
                             if show_debug_info:
@@ -294,23 +487,34 @@ def main():
                                             if 'bbox' in change:
                                                 bbox = change['bbox']
                                                 st.write(f"  Location: ({bbox[0]}, {bbox[1]}) Size: {bbox[2]}x{bbox[3]}")
+                                            # Show additional ultra-sensitive details
+                                            if detection_mode == "Ultra Sensitive" and 'max_intensity' in change:
+                                                st.write(f"  Max Intensity: {change['max_intensity']:.1f}")
+                                                st.write(f"  Avg Intensity: {change.get('avg_intensity', 0):.1f}")
+                                            if 'confidence' in change:
+                                                st.write(f"  Confidence: {change['confidence']:.2f}")
                         else:
-                            st.image(img_updated, width='stretch', caption=f"Updated - Page {current_page_num + 1}")
+                            st.image(img_updated, use_column_width=True, caption=f"Updated - Page {updated_page_num + 1}")
                             # Still perform analysis for summary
                             rec = st.session_state.get('calibrated_params') if apply_calibrated else None
                             use_thr = rec['threshold'] if rec else threshold
                             use_msz = rec['min_change_size'] if rec else min_change_size
                             use_mar = rec['min_change_area'] if rec else min_change_area
-                            _, changes, ssim_score = find_image_differences(
-                                img_original,
-                                img_updated,
-                                threshold=use_thr,
-                                min_change_size=use_msz,
-                                min_change_area=use_mar,
-                                enable_edge_detection=enable_edge_detection,
-                                enable_color_detection=enable_color_detection,
-                                roi=(roi_x, roi_y, roi_w, roi_h) if roi_enable and roi_w > 0 and roi_h > 0 else None
-                            )
+                            
+                            # Use appropriate detection method
+                            if detection_mode == "Ultra Sensitive":
+                                _, changes, ssim_score = find_ultra_subtle_differences(img_original, img_updated)
+                            else:
+                                _, changes, ssim_score = find_image_differences(
+                                    img_original,
+                                    img_updated,
+                                    threshold=use_thr,
+                                    min_change_size=use_msz,
+                                    min_change_area=use_mar,
+                                    enable_edge_detection=enable_edge_detection,
+                                    enable_color_detection=enable_color_detection,
+                                    roi=(roi_x, roi_y, roi_w, roi_h) if roi_enable and roi_w > 0 and roi_h > 0 else None
+                                )
                         
                         # Pixel-wise comparison if enabled
                         if show_pixel_comparison:
@@ -329,24 +533,25 @@ def main():
                                                  np.array([255, 0, 0]), 
                                                  original_array)
                                 overlay_img = Image.fromarray(overlay.astype(np.uint8))
-                                st.image(overlay_img, caption="Pixel-level differences (Red)", width='stretch')
+                                st.image(overlay_img, caption="Pixel-level differences (Red)", use_column_width=True)
                         
                         # Store changes in session state for summary
-                        st.session_state[f'page_{current_page_num}_changes'] = changes
+                        st.session_state[f'page_{current_logical_page}_changes'] = changes
                 else:
-                    st.image(img_updated, width='stretch', caption=f"Updated - Page {current_page_num + 1}")
-                    st.session_state[f'page_{current_page_num}_changes'] = []
+                    # Display regular updated image when no highlighting is available
+                    st.image(img_updated, use_column_width=True, caption=f"Updated - Page {updated_page_num + 1}")
+                    st.session_state[f'page_{current_logical_page}_changes'] = []
             else:
-                st.info("Page not present in Updated Document (likely an addition).")
-                st.session_state[f'page_{current_page_num}_changes'] = []
+                st.info("Page not present in Updated Document.")
+                st.session_state[f'page_{current_logical_page}_changes'] = []
 
             # Display updated text for the page
             updated_page_text = ""
-            if get_file_type(uploaded_file2.name) == 'pdf':
+            if get_file_type(uploaded_file2.name) == 'pdf' and updated_page_num is not None:
                 uploaded_file2.seek(0)
                 doc = fitz.open(stream=uploaded_file2.read(), filetype="pdf")
-                if current_page_num < doc.page_count:
-                    updated_page_text = doc.load_page(current_page_num).get_text()
+                if updated_page_num < doc.page_count:
+                    updated_page_text = doc.load_page(updated_page_num).get_text()
                 doc.close()
 
         with col3:
@@ -384,13 +589,14 @@ def main():
             
             # Current page changes
             st.subheader("Changes on this Page")
-            current_changes = st.session_state.get(f'page_{current_page_num}_changes', [])
+            current_changes = st.session_state.get(f'page_{current_logical_page}_changes', [])
             
             if current_changes:
-                for change in current_changes:
+                for i, change in enumerate(current_changes):
                     change_type = change['type']
-                    change_num = change['number']
-                    description = change['description']
+                    # Handle both old format (with 'number') and new format (without 'number')
+                    change_num = change.get('number', i + 1)
+                    description = change.get('description', f"{change_type}: {change.get('text', 'Visual change')}")
                     
                     if change_type == 'addition':
                         color = '#e6ffe6'
@@ -405,6 +611,10 @@ def main():
                     # Use Streamlit components for better visibility
                     with st.container():
                         st.markdown(f"**{change_num}.** {icon} {description}")
+                        # Show document indicator for text changes
+                        if 'document' in change:
+                            doc_indicator = f"📄 {change['document']} document"
+                            st.caption(doc_indicator)
                         st.markdown("---")
             else:
                 st.info("No changes detected on this page.")
@@ -518,15 +728,16 @@ def generate_review_summary(file1_name, file2_name, additions, removals, modific
         summary['page_by_page_changes'][page_num].append(change)
         summary['change_details'].append({
             'page': page_num + 1,  # Convert to 1-based indexing
-            'change_number': change['number'],
+            'change_number': change.get('number', 'N/A'),
             'type': change['type'],
-            'description': change['description']
+            'description': change.get('description', f"{change['type']}: {change.get('text', 'Visual change')}")
         })
     
     return summary
 
 def generate_comparison_report(file1_name, file2_name, additions, removals, modifications, session_state):
     """Generates a detailed comparison report."""
+    import datetime
     st.info("Generating comparison report...")
     
     # Create report content
@@ -553,7 +764,8 @@ def generate_comparison_report(file1_name, file2_name, additions, removals, modi
             page_num = int(key.split('_')[1]) + 1  # Convert to 1-based
             report_content += f"\n### Page {page_num}\n"
             for change in value:
-                report_content += f"- **{change['type'].title()}:** {change['description']}\n"
+                description = change.get('description', f"{change['type']}: {change.get('text', 'Visual change')}")
+                report_content += f"- **{change['type'].title()}:** {description}\n"
     
     # Display the report
     st.markdown(report_content)
