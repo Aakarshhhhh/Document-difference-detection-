@@ -5,7 +5,8 @@ import fitz
 import streamlit.components.v1 as components
 
 from utils.file_conversion import convert_to_comparable_format, get_file_type
-from utils.image_comparison import find_image_differences, compare_images_pixel_wise, find_ultra_subtle_differences
+from utils.image_comparison import find_image_differences, compare_images_pixel_wise, find_ultra_subtle_differences, detect_large_content_blocks
+from utils.enhanced_missing_image_detector import detect_missing_images_enhanced
 from utils.text_comparison import compare_texts, highlight_text_differences_html, get_text_diff_summary, find_word_level_changes, create_text_diff_image
 import json
 import datetime
@@ -109,10 +110,17 @@ def main():
             
             # Enhanced threshold options
             st.subheader("Detection Sensitivity")
+            
+            # Override with quick settings if applied
+            if st.session_state.get('quick_setup_applied', False):
+                default_mode_index = 0  # Ultra Sensitive
+            else:
+                default_mode_index = 3  # Balanced
+                
             detection_mode = st.selectbox(
                 "Detection Mode",
                 ["Ultra Sensitive", "Very Sensitive", "Sensitive", "Balanced", "Conservative"],
-                index=3  # Default to "Balanced" for better noise reduction
+                index=default_mode_index
             )
             
             # Map detection modes to thresholds
@@ -136,7 +144,35 @@ def main():
                 enable_color_detection = st.checkbox("Enable Color Change Detection", value=True)
                 enable_template_matching = st.checkbox("Enable Template Matching", value=False)
                 enable_text_highlighting = st.checkbox("Enable Word-Level Text Highlighting", value=True, help="Highlight specific text changes like additions, deletions, and modifications directly on the document")
+                enable_large_block_detection = st.checkbox("Enable Large Visual Element Detection", value=True, help="Detect large added/removed visual elements like diagrams, screenshots, tables, and code blocks")
+                # Quick setup overrides
+                quick_setup = st.session_state.get('quick_setup_applied', False)
+                
+                enable_enhanced_missing_detection = st.checkbox("Enhanced Missing Image Detection", value=True if quick_setup else True, help="Best method for detecting missing screenshots, diagrams, and charts")
+                missing_image_sensitivity = st.slider("Missing Image Sensitivity", 0.5, 0.9, 0.7 if quick_setup else 0.7, 0.1, help="Higher = more sensitive to missing visual elements")
+                min_missing_area = st.slider("Min Missing Area (pixels)", 1000, 20000, 5000 if quick_setup else 5000, 1000, help="Minimum size for missing visual elements")
                 min_change_size = st.slider("Minimum Change Size (pixels)", 5, 50, 10)
+            
+            # Quick Settings for Missing Image Detection
+            st.header("🎯 Quick Setup for Missing Images")
+            
+            col_quick1, col_quick2 = st.columns(2)
+            with col_quick1:
+                if st.button("🚀 Optimize for Missing Images", help="Click to automatically set best settings for detecting missing screenshots, diagrams, and charts"):
+                    st.session_state['quick_setup_applied'] = True
+                    st.success("✅ Settings optimized!")
+            
+            with col_quick2:
+                if st.button("⚡ Force Aggressive Detection", help="Force ultra-aggressive detection on current page"):
+                    st.session_state['force_aggressive'] = True
+                    st.warning("⚡ Aggressive detection will be applied!")
+            
+            # Show current status
+            if st.session_state.get('quick_setup_applied', False):
+                st.info("🎯 Optimization: Enhanced Detection ON, Ultra Sensitive mode")
+            
+            if st.session_state.get('force_aggressive', False):
+                st.warning("⚡ Aggressive mode: Min Area 1000px, Sensitivity 0.9")
             
             # Additional options
             st.header("Display Options")
@@ -349,13 +385,38 @@ def main():
             st.subheader("Original Version")
             if original_page_num is not None:
                 try:
-                    # Display highlighted version if available, otherwise original
-                    if original_highlighted_img is not None:
+                    # Check if we have large-block annotations for this page
+                    lb_original_key = f'lb_original_{current_logical_page}'
+                    lb_original_img = st.session_state.get(lb_original_key)
+                    
+                    # Display in priority order: text+visual highlights > text highlights > visual highlights > original
+                    if original_highlighted_img is not None and lb_original_img is not None:
+                        # Show text highlights with note about visual changes
+                        st.image(original_highlighted_img, use_column_width=True, 
+                               caption=f"🔴 Original with Text Deletions - Page {original_page_num + 1}")
+                        deletions = sum(1 for c in text_changes if c['type'] == 'deletion')
+                        st.success(f"✨ Showing {deletions} red text deletion highlights")
+                        
+                        # Also show large-block highlights for missing visual content
+                        st.image(lb_original_img, use_column_width=True,
+                               caption=f"🖼️ Original with Missing Visual Elements - Page {original_page_num + 1}")
+                        removals = sum(1 for c in st.session_state.get(f'page_{current_logical_page}_changes', []) if 'large_removal' in str(c.get('type', '')))
+                        if removals > 0:
+                            st.info(f"🔴 Showing {removals} missing visual element(s) highlighted in red")
+                    
+                    elif original_highlighted_img is not None:
                         st.image(original_highlighted_img, use_column_width=True, 
                                caption=f"🔴 Original with Deletions - Page {original_page_num + 1}")
-                        # Add status indicator
                         deletions = sum(1 for c in text_changes if c['type'] == 'deletion')
                         st.success(f"✨ Showing {deletions} red deletion highlights")
+                    
+                    elif lb_original_img is not None:
+                        st.image(lb_original_img, use_column_width=True,
+                               caption=f"🖼️ Original with Missing Visual Elements - Page {original_page_num + 1}")
+                        removals = sum(1 for c in st.session_state.get(f'page_{current_logical_page}_changes', []) if 'large_removal' in str(c.get('type', '')) or c.get('type') == 'removal')
+                        if removals > 0:
+                            st.info(f"🔴 Showing {removals} missing visual element(s) highlighted in red")
+                    
                     elif 0 <= original_page_num < len(images1):
                         st.image(images1[original_page_num], use_column_width=True, caption=f"Original - Page {original_page_num + 1}")
                     else:
@@ -389,10 +450,101 @@ def main():
                     st.session_state[f'page_{current_logical_page}_changes'] = []
                     return
                 
-                # Display highlighted version if available, otherwise original
-                if updated_highlighted_img is not None:
+                # Run enhanced visual detection first (before any display logic)
+                if enable_enhanced_missing_detection and original_page_num is not None:
+                    lb_updated_key = f'lb_updated_{current_logical_page}'
+                    
+                    # Only run if we haven't already processed this page
+                    if lb_updated_key not in st.session_state:
+                        with st.spinner("🔍 Scanning for missing images, diagrams, and screenshots..."):
+                            try:
+                                img_original = images1[original_page_num]
+                                
+                                # Use more aggressive settings for better detection
+                                if st.session_state.get('force_aggressive', False):
+                                    # Ultra-aggressive forced settings
+                                    effective_sensitivity = 0.9
+                                    effective_min_area = 1000
+                                    st.session_state['force_aggressive'] = False  # Reset after use
+                                else:
+                                    # Standard aggressive settings
+                                    effective_sensitivity = max(0.8, missing_image_sensitivity)  # At least 0.8
+                                    effective_min_area = min(3000, min_missing_area)  # At most 3000 pixels
+                                
+                                enhanced_original_img, enhanced_updated_img, enhanced_changes, enhanced_similarity = detect_missing_images_enhanced(
+                                    img_original, img_updated,
+                                    min_missing_area=effective_min_area,
+                                    sensitivity=effective_sensitivity
+                                )
+                                
+                                if enhanced_changes:
+                                    st.success(f"🎯 Found {len(enhanced_changes)} visual changes!")
+                                    
+                                    # Count types of changes
+                                    missing_count = sum(1 for c in enhanced_changes if 'missing' in c.get('type', '').lower())
+                                    added_count = sum(1 for c in enhanced_changes if 'add' in c.get('type', '').lower())
+                                    
+                                    # Store enhanced results for display
+                                    if missing_count > 0:
+                                        st.session_state[f'lb_original_{current_logical_page}'] = enhanced_original_img
+                                        st.info(f"🔴 {missing_count} missing visual elements highlighted in red")
+                                    
+                                    if added_count > 0:
+                                        st.session_state[f'lb_updated_{current_logical_page}'] = enhanced_updated_img
+                                        st.info(f"🟢 {added_count} added visual elements highlighted in green")
+                                    
+                                    # Convert enhanced changes to standard format and store
+                                    enhanced_changes_formatted = [{
+                                        'type': 'addition' if 'add' in c.get('type', '').lower() else ('removal' if 'missing' in c.get('type', '').lower() else 'modification'),
+                                        'description': c.get('description', 'Visual element'),
+                                        'bbox': c.get('bbox', (0, 0, 0, 0)),
+                                        'number': i + 1,
+                                        'confidence': c.get('confidence', 0),
+                                        'area': c.get('area', 0)
+                                    } for i, c in enumerate(enhanced_changes)]
+                                    
+                                    # Store changes for summary
+                                    st.session_state[f'page_{current_logical_page}_changes'] = enhanced_changes_formatted
+                                else:
+                                    # No changes found, ensure we don't have stale data
+                                    st.session_state.pop(f'lb_original_{current_logical_page}', None)
+                                    st.session_state.pop(f'lb_updated_{current_logical_page}', None)
+                                    st.session_state[f'page_{current_logical_page}_changes'] = []
+                                    
+                            except Exception as e:
+                                if show_debug_info:
+                                    st.error(f"❌ Enhanced detection failed: {e}")
+                                # Clean up on error
+                                st.session_state.pop(f'lb_original_{current_logical_page}', None)
+                                st.session_state.pop(f'lb_updated_{current_logical_page}', None)
+                                st.session_state[f'page_{current_logical_page}_changes'] = []
+                
+                # Check if we have large-block annotations for this page
+                lb_updated_key = f'lb_updated_{current_logical_page}'
+                lb_updated_img = st.session_state.get(lb_updated_key)
+                
+                # Display highlighted version - priority order: visual highlights > text highlights > original
+                # Check for enhanced detection results first
+                if lb_updated_img is not None:
+                    st.image(lb_updated_img, use_column_width=True,
+                           caption=f"🖼️ Updated with Added Visual Elements - Page {updated_page_num + 1}")
+                    additions_visual = sum(1 for c in st.session_state.get(f'page_{current_logical_page}_changes', []) if 'large_addition' in str(c.get('type', '')) or c.get('type') == 'addition')
+                    if additions_visual > 0:
+                        st.success(f"🟢 Showing {additions_visual} added visual element(s) highlighted in green")
+                    
+                    # Also show text highlights if available
+                    if updated_highlighted_img is not None:
+                        st.image(updated_highlighted_img, use_column_width=True, 
+                                caption=f"🟢 Updated with Text Additions - Page {updated_page_num + 1}")
+                        
+                        # Count and display change information
+                        deletions = sum(1 for c in text_changes if c['type'] == 'deletion')
+                        additions = sum(1 for c in text_changes if c['type'] == 'addition')
+                        st.info(f"📚 Found {len(text_changes)} word-level changes ({deletions} deletions, {additions} additions)")
+                        
+                elif updated_highlighted_img is not None:
                     st.image(updated_highlighted_img, use_column_width=True, 
-                            caption=f"🟢 Updated with Additions - Page {updated_page_num + 1}")
+                            caption=f"🟢 Updated with Text Additions - Page {updated_page_num + 1}")
                     
                     # Count and display change information
                     deletions = sum(1 for c in text_changes if c['type'] == 'deletion')
@@ -410,9 +562,26 @@ def main():
                                 doc_indicator = f"({change.get('document', 'unknown')})"
                                 st.write(f"{color} **{change['type'].title()}** {doc_indicator}: '{change['text']}'")
                     
-                    # Store text changes for summary
-                    changes = text_changes
-                    ssim_score = 1.0 - (len(text_changes) * 0.1)  # Rough estimate
+                    # Hybrid: also run large-block detector to catch missing/added diagrams
+                    if enable_large_block_detection:
+                        with st.spinner("Scanning for large visual changes (diagrams/images)..."):
+                            lb_original_img, lb_updated_img, lb_changes, lb_ssim = detect_large_content_blocks(images1[original_page_num], images2[updated_page_num])
+                            if lb_changes:
+                                # Store the large-block annotated images for later use
+                                st.session_state[f'lb_original_{current_logical_page}'] = lb_original_img
+                                st.session_state[f'lb_updated_{current_logical_page}'] = lb_updated_img
+                                if show_debug_info:
+                                    st.info(f"🖼️ Large-block detector found {len(lb_changes)} region(s)")
+                    else:
+                        lb_changes = []
+                    
+                    # Store text changes and large-block changes together for summary
+                    changes = text_changes + [{
+                        'type': 'addition' if c['type'] == 'large_addition' else ('removal' if c['type'] == 'large_removal' else 'modification'),
+                        'description': c['description'],
+                        'bbox': c['bbox']
+                    } for c in (lb_changes or [])]
+                    ssim_score = 1.0  # Not meaningful in hybrid view
                     
                     # Store changes in session state for summary
                     st.session_state[f'page_{current_logical_page}_changes'] = changes
@@ -464,8 +633,33 @@ def main():
                                         roi=(roi_x, roi_y, roi_w, roi_h) if roi_enable and roi_w > 0 and roi_h > 0 else None
                                     )
                                 
-                                if diff_img is not None:
-                                    st.image(diff_img, use_column_width=True, caption=f"Updated - Page {updated_page_num + 1} (SSIM: {ssim_score:.2f})")
+                                # Note: Enhanced missing image detection now runs earlier in the process
+                                
+                                # Also run large-block detector if enabled (as backup)
+                                if enable_large_block_detection:
+                                    with st.spinner("Scanning for large visual elements..."):
+                                        lb_original_img, lb_updated_img, lb_changes, _ = detect_large_content_blocks(img_original, img_updated)
+                                        if lb_changes:
+                                            # Store for use in the original document display
+                                            st.session_state[f'lb_original_{current_logical_page}'] = lb_original_img
+                                            st.session_state[f'lb_updated_{current_logical_page}'] = lb_updated_img
+                                            
+                                            st.image(lb_updated_img, use_column_width=True, caption=f"Large visual changes - Page {updated_page_num + 1}")
+                                            st.info(f"🖼️ Detected {len(lb_changes)} large visual change(s) (diagrams/images/tables)")
+                                            
+                                            # Merge changes with existing ones
+                                            lb_changes_formatted = [{
+                                                'type': 'addition' if c['type'] == 'large_addition' else ('removal' if c['type'] == 'large_removal' else 'modification'),
+                                                'description': c['description'],
+                                                'bbox': c['bbox'],
+                                                'number': len(changes) + i + 1
+                                            } for i, c in enumerate(lb_changes)]
+                                            changes.extend(lb_changes_formatted)
+                                        elif diff_img is not None:
+                                            st.image(diff_img, use_column_width=True, caption=f"Updated - Page {updated_page_num + 1} (SSIM: {ssim_score:.2f})")
+                                else:
+                                    if diff_img is not None:
+                                        st.image(diff_img, use_column_width=True, caption=f"Updated - Page {updated_page_num + 1} (SSIM: {ssim_score:.2f})")
                             
                             
                             # Enhanced debug information
@@ -515,6 +709,22 @@ def main():
                                     enable_color_detection=enable_color_detection,
                                     roi=(roi_x, roi_y, roi_w, roi_h) if roi_enable and roi_w > 0 and roi_h > 0 else None
                                 )
+                            
+                            # Also run large-block detector if enabled
+                            if enable_large_block_detection:
+                                lb_original_img, lb_updated_img, lb_changes, _ = detect_large_content_blocks(img_original, img_updated)
+                                if lb_changes:
+                                    # Store for use in the original document display
+                                    st.session_state[f'lb_original_{current_logical_page}'] = lb_original_img
+                                    st.session_state[f'lb_updated_{current_logical_page}'] = lb_updated_img
+                                    
+                                    lb_changes_formatted = [{
+                                        'type': 'addition' if c['type'] == 'large_addition' else ('removal' if c['type'] == 'large_removal' else 'modification'),
+                                        'description': c['description'],
+                                        'bbox': c['bbox'],
+                                        'number': len(changes) + i + 1
+                                    } for i, c in enumerate(lb_changes)]
+                                    changes.extend(lb_changes_formatted)
                         
                         # Pixel-wise comparison if enabled
                         if show_pixel_comparison:
@@ -540,7 +750,9 @@ def main():
                 else:
                     # Display regular updated image when no highlighting is available
                     st.image(img_updated, use_column_width=True, caption=f"Updated - Page {updated_page_num + 1}")
-                    st.session_state[f'page_{current_logical_page}_changes'] = []
+                    # If enhanced detection already ran but found no changes, preserve that
+                    if f'page_{current_logical_page}_changes' not in st.session_state:
+                        st.session_state[f'page_{current_logical_page}_changes'] = []
             else:
                 st.info("Page not present in Updated Document.")
                 st.session_state[f'page_{current_logical_page}_changes'] = []

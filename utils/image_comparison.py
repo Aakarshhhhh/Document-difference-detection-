@@ -804,6 +804,225 @@ def compare_images_pixel_wise(img1, img2, threshold=30):
     
     return mask
 
+def detect_large_content_blocks(img1: Image.Image, img2: Image.Image, min_block_size=50000, return_mask=False):
+    """
+    Specialized detection for large content blocks like diagrams, screenshots, tables, etc.
+    This is optimized for detecting significant visual additions or removals.
+    Returns separate annotated images for original (showing removals) and updated (showing additions).
+    """
+    # Ensure same size
+    if img1.size != img2.size:
+        img2 = img2.resize(img1.size, Image.Resampling.LANCZOS)
+    
+    # Convert to numpy arrays
+    arr1 = np.array(img1.convert('RGB'))
+    arr2 = np.array(img2.convert('RGB'))
+    
+    img_height, img_width = arr1.shape[:2]
+    img_area = img_height * img_width
+    
+    # === LARGE CONTENT BLOCK DETECTION ===
+    
+    # 1. High-level structural difference using segmentation
+    gray1 = cv2.cvtColor(arr1, cv2.COLOR_RGB2GRAY)
+    gray2 = cv2.cvtColor(arr2, cv2.COLOR_RGB2GRAY)
+    
+    # Apply strong gaussian blur to identify large regions
+    blur_kernel = max(15, int(min(img_width, img_height) / 50))
+    if blur_kernel % 2 == 0:
+        blur_kernel += 1
+        
+    blurred1 = cv2.GaussianBlur(gray1, (blur_kernel, blur_kernel), 0)
+    blurred2 = cv2.GaussianBlur(gray2, (blur_kernel, blur_kernel), 0)
+    
+    # Find large-scale differences
+    large_scale_diff = cv2.absdiff(blurred1, blurred2)
+    
+    # Use adaptive threshold for large content detection
+    threshold_value = max(20, int(np.mean(large_scale_diff) + 0.5 * np.std(large_scale_diff)))
+    _, block_mask = cv2.threshold(large_scale_diff, threshold_value, 255, cv2.THRESH_BINARY)
+    
+    # 2. Morphological operations to consolidate regions
+    # Large kernel to merge nearby changes into blocks
+    consolidate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (blur_kernel, blur_kernel))
+    block_mask = cv2.morphologyEx(block_mask, cv2.MORPH_CLOSE, consolidate_kernel)
+    block_mask = cv2.morphologyEx(block_mask, cv2.MORPH_DILATE, consolidate_kernel)
+    
+    # 3. Find large contiguous regions
+    contours = cv2.findContours(block_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours = contours[0] if len(contours) == 2 else contours[1]
+    
+    # Filter for large blocks only
+    large_blocks = []
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        x, y, w, h = cv2.boundingRect(contour)
+        
+        # Must be a significant portion of the page
+        area_ratio = area / img_area
+        size_threshold = min_block_size / img_area
+        
+        # Accept if area is significant OR dimensions suggest a large block
+        if (area_ratio > size_threshold or 
+            (w > img_width * 0.3 and h > img_height * 0.2) or  # Wide horizontal blocks
+            (w > img_width * 0.2 and h > img_height * 0.3)):   # Tall vertical blocks
+            large_blocks.append(contour)
+    
+    # 4. Create annotated image showing large blocks
+    img_annotated = Image.fromarray(arr2)
+    draw = ImageDraw.Draw(img_annotated)
+    
+    # Load font
+    try:
+        font = ImageFont.truetype("arial.ttf", 24)
+    except:
+        try:
+            font = ImageFont.truetype("C:/Windows/Fonts/arial.ttf", 24)
+        except:
+            font = ImageFont.load_default()
+    
+    changes = []
+    change_number = 1
+    
+    for contour in large_blocks:
+        x, y, w, h = cv2.boundingRect(contour)
+        area = cv2.contourArea(contour)
+        
+        # Analyze the content in this region to determine change type
+        region1 = gray1[y:y+h, x:x+w]
+        region2 = gray2[y:y+h, x:x+w]
+        
+        # Calculate content density (how much "stuff" is in each region)
+        edges1 = cv2.Canny(region1, 30, 100)
+        edges2 = cv2.Canny(region2, 30, 100)
+        
+        density1 = np.sum(edges1 > 0) / (w * h)
+        density2 = np.sum(edges2 > 0) / (w * h)
+        
+        mean1 = np.mean(region1)
+        mean2 = np.mean(region2)
+        
+        # Determine change type based on content analysis
+        if density2 > density1 + 0.01 or mean2 < mean1 - 10:  # More content in region2
+            change_type = "large_addition"
+            color = (0, 200, 0)  # Bright green for large additions
+            description = f"Large content block added (diagram/screenshot/table)"
+        elif density1 > density2 + 0.01 or mean1 < mean2 - 10:  # More content in region1
+            change_type = "large_removal"
+            color = (200, 0, 0)  # Bright red for large removals
+            description = f"Large content block removed (diagram/screenshot/table)"
+        else:
+            change_type = "large_modification"
+            color = (200, 100, 0)  # Orange for large modifications
+            description = f"Large content block modified (diagram/screenshot/table)"
+        
+        change_info = {
+            'number': change_number,
+            'type': change_type,
+            'bbox': (x, y, w, h),
+            'description': description,
+            'area': int(area),
+            'area_ratio': area / img_area,
+            'content_density_1': float(density1),
+            'content_density_2': float(density2),
+            'color': color
+        }
+        
+        changes.append(change_info)
+        change_number += 1
+    
+    # Now create separate annotated images for original and updated documents
+    img_original_annotated = Image.fromarray(arr1)  # Original image base
+    img_updated_annotated = Image.fromarray(arr2)    # Updated image base
+    
+    draw_original = ImageDraw.Draw(img_original_annotated)
+    draw_updated = ImageDraw.Draw(img_updated_annotated)
+    
+    # Draw highlights on appropriate images
+    for change in changes:
+        x, y, w, h = change['bbox']
+        color = change['color']
+        change_type = change['type']
+        number = change['number']
+        
+        # Calculate circle position
+        circle_radius = min(25, max(15, int(min(w, h) * 0.08)))
+        circle_x = x + w + circle_radius + 5
+        circle_y = y + circle_radius + 5
+        circle_x = min(circle_x, img_width - circle_radius - 5)
+        circle_y = min(circle_y, img_height - circle_radius - 5)
+        
+        # Draw on appropriate image based on change type
+        if change_type == "large_removal":
+            # Draw on ORIGINAL image to show what was removed
+            draw_original.rectangle([x, y, x + w, y + h], outline=color, width=5)
+            draw_original.ellipse([circle_x - circle_radius, circle_y - circle_radius,
+                                 circle_x + circle_radius, circle_y + circle_radius], 
+                                fill=color, outline=(255, 255, 255), width=3)
+            
+            # Draw number
+            number_text = str(number)
+            try:
+                text_bbox = draw_original.textbbox((0, 0), number_text, font=font)
+                text_width = text_bbox[2] - text_bbox[0]
+                text_height = text_bbox[3] - text_bbox[1]
+            except:
+                text_width, text_height = len(number_text) * 12, 16
+            
+            text_x = circle_x - text_width // 2
+            text_y = circle_y - text_height // 2
+            draw_original.text((text_x + 2, text_y + 2), number_text, fill=(0, 0, 0), font=font)
+            draw_original.text((text_x, text_y), number_text, fill=(255, 255, 255), font=font)
+            
+        elif change_type == "large_addition":
+            # Draw on UPDATED image to show what was added
+            draw_updated.rectangle([x, y, x + w, y + h], outline=color, width=5)
+            draw_updated.ellipse([circle_x - circle_radius, circle_y - circle_radius,
+                                circle_x + circle_radius, circle_y + circle_radius], 
+                               fill=color, outline=(255, 255, 255), width=3)
+            
+            # Draw number
+            number_text = str(number)
+            try:
+                text_bbox = draw_updated.textbbox((0, 0), number_text, font=font)
+                text_width = text_bbox[2] - text_bbox[0]
+                text_height = text_bbox[3] - text_bbox[1]
+            except:
+                text_width, text_height = len(number_text) * 12, 16
+            
+            text_x = circle_x - text_width // 2
+            text_y = circle_y - text_height // 2
+            draw_updated.text((text_x + 2, text_y + 2), number_text, fill=(0, 0, 0), font=font)
+            draw_updated.text((text_x, text_y), number_text, fill=(255, 255, 255), font=font)
+            
+        else:  # modification - draw on both
+            for draw_obj in [draw_original, draw_updated]:
+                draw_obj.rectangle([x, y, x + w, y + h], outline=color, width=5)
+                draw_obj.ellipse([circle_x - circle_radius, circle_y - circle_radius,
+                                circle_x + circle_radius, circle_y + circle_radius], 
+                               fill=color, outline=(255, 255, 255), width=3)
+                
+                number_text = str(number)
+                try:
+                    text_bbox = draw_obj.textbbox((0, 0), number_text, font=font)
+                    text_width = text_bbox[2] - text_bbox[0]
+                    text_height = text_bbox[3] - text_bbox[1]
+                except:
+                    text_width, text_height = len(number_text) * 12, 16
+                
+                text_x = circle_x - text_width // 2
+                text_y = circle_y - text_height // 2
+                draw_obj.text((text_x + 2, text_y + 2), number_text, fill=(0, 0, 0), font=font)
+                draw_obj.text((text_x, text_y), number_text, fill=(255, 255, 255), font=font)
+    
+    # Calculate similarity score
+    total_changed_area = sum(cv2.contourArea(c) for c in large_blocks)
+    similarity_score = 1.0 - (total_changed_area / img_area)
+    
+    if return_mask:
+        return img_original_annotated, img_updated_annotated, changes, similarity_score, block_mask
+    return img_original_annotated, img_updated_annotated, changes, similarity_score
+
 def find_ultra_subtle_differences(img1: Image.Image, img2: Image.Image, return_mask: bool = False):
     """
     Ultra-sensitive detection for very subtle changes that standard algorithms miss.
